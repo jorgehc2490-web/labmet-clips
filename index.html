@@ -147,6 +147,8 @@ footer{text-align:center;color:var(--mut);font-size:13px;padding:24px 16px 40px;
     <button class="bigbtn" id="analyzeBtn" type="button">✂ Buscar los mejores momentos</button>
     <div class="progress" id="progWrap"><i id="progBar"></i></div>
     <div class="status" id="status"></div>
+    <button class="btn hidden" id="cancelBtn" type="button" style="margin-top:10px">✖ Cancelar análisis</button>
+    <p class="hint">El análisis es rápido (menos de 2 minutos) y tiene límite de tiempo automático: si algo se demora, la app sigue con lo que ya analizó. Mientras analiza, deja esta pantalla abierta y encendida: si cambias de app, el teléfono pausa la página y el análisis se detiene.</p>
   </section>
 
   <!-- PASO 3 -->
@@ -170,7 +172,7 @@ footer{text-align:center;color:var(--mut);font-size:13px;padding:24px 16px 40px;
 <script>
 "use strict";
 const $=s=>document.querySelector(s);
-const state={mode:"yt",file:null,fileUrl:null,duration:0,transcriptEntries:[],clips:[],ytId:null,audioScores:null,motionScores:null};
+const state={mode:"yt",file:null,fileUrl:null,duration:0,transcriptEntries:[],clips:[],ytId:null,audioScores:null,motionScores:null,cancelled:false};
 
 /* ---------- utilidades ---------- */
 function fmt(t){t=Math.max(0,Math.round(t));const h=Math.floor(t/3600),m=Math.floor(t%3600/60),s=t%60;return (h?h+":":"") + String(m).padStart(2,"0")+":"+String(s).padStart(2,"0");}
@@ -266,39 +268,59 @@ function buildSrt(clip){
   return chunks.map((c,i)=>String(i+1)+"\n"+fmtSrt(i*each)+" --> "+fmtSrt(Math.min(dur,(i+1)*each))+"\n"+c).join("\n\n")+"\n";
 }
 
-/* ---------- análisis: video subido (audio + movimiento) ---------- */
+/* ---------- análisis: video subido (audio + movimiento, con límites de tiempo) ---------- */
+function withTimeout(promise,ms){return Promise.race([promise,new Promise((_,rej)=>setTimeout(()=>rej(new Error("timeout")),ms))]);}
 async function analyzeUploaded(durWanted){
-  const file=state.file;const total=state.duration;
-  setProg(8);setStatus("Escuchando el audio para encontrar los momentos de más energía…");
-  let audioPerSec=new Array(Math.ceil(total)).fill(0);
-  try{
-    const buf=await file.arrayBuffer();const AC=window.AudioContext||window.webkitAudioContext;const ctx=new AC();
-    const audio=await ctx.decodeAudioData(buf.slice(0));const ch=audio.getChannelData(0);const sr=audio.sampleRate;
-    for(let s=0;s<audioPerSec.length;s++){let sum=0;const from=Math.floor(s*sr),to=Math.min(ch.length,Math.floor((s+1)*sr));const step=Math.max(1,Math.floor((to-from)/600));let n=0;for(let i=from;i<to;i+=step){sum+=ch[i]*ch[i];n++;}audioPerSec[s]=Math.sqrt(sum/Math.max(1,n));}
-    ctx.close();
-  }catch(e){/* sin audio decodificable: seguimos con movimiento */}
+  const file=state.file;const total=state.duration;const t0=Date.now();
+  let audioPerSec=new Array(Math.ceil(total)).fill(0);let audioOk=false;
+  /* Fase audio: SOLO si el archivo no es gigante, y con límite de 40 s.
+     Antes se decodificaba el audio COMPLETO sin límite: en el teléfono un video
+     largo podía quedarse ahí una hora. Ahora, si se pasa, se sigue sin audio. */
+  if(file.size<=120*1024*1024){
+    setProg(8);setStatus("Escuchando el audio para encontrar los momentos de más energía (máx. 40 s)…");
+    try{
+      const buf=await withTimeout(file.arrayBuffer(),20000);
+      const AC=window.AudioContext||window.webkitAudioContext;const ctx=new AC();
+      const audio=await withTimeout(ctx.decodeAudioData(buf.slice(0)),40000);
+      const ch=audio.getChannelData(0);const sr=audio.sampleRate;
+      for(let s=0;s<audioPerSec.length;s++){let sum=0;const from=Math.floor(s*sr),to=Math.min(ch.length,Math.floor((s+1)*sr));const step=Math.max(1,Math.floor((to-from)/600));let n=0;for(let i=from;i<to;i+=step){sum+=ch[i]*ch[i];n++;}audioPerSec[s]=Math.sqrt(sum/Math.max(1,n));}
+      audioOk=true;try{ctx.close();}catch(e){}
+    }catch(e){/* audio lento o no decodificable: seguimos con imagen */}
+    if(state.cancelled)throw new Error("cancelado");
+  }else{
+    setProg(20);setStatus("Video grande ("+Math.round(file.size/1048576)+" MB): salto la lectura completa de audio y analizo por imagen, que es más rápido en el teléfono.");
+  }
+  /* Fase imagen: pocas muestras (máx. 18) y cada salto con límite de 2,5 s. */
   setProg(45);setStatus("Mirando los cambios de imagen (mapas, gráficos, zooms)…");
-  const motion={};const v=document.createElement("video");v.muted=true;v.src=state.fileUrl;v.playsInline=true;
-  await new Promise(r=>{v.onloadedmetadata=r;});
+  const motion={};const v=document.createElement("video");v.muted=true;v.preload="auto";v.src=state.fileUrl;v.playsInline=true;
+  try{await withTimeout(new Promise(r=>{v.onloadedmetadata=r;}),10000);}catch(e){}
   const cv=document.createElement("canvas");cv.width=128;cv.height=72;const cx=cv.getContext("2d",{willReadFrequently:true});
-  let prev=null;const samples=Math.min(48,Math.max(8,Math.floor(total/3)));
+  let prev=null;const samples=Math.min(18,Math.max(6,Math.floor(total/10)));
   for(let i=0;i<samples;i++){
+    if(state.cancelled)throw new Error("cancelado");
+    if(Date.now()-t0>100000)break; /* tope global: nunca más de ~100 s en esta fase */
     const t=(i/(samples-1))*Math.max(0,total-1);
-    await new Promise(r=>{v.onseeked=r;v.currentTime=t;});
+    try{await withTimeout(new Promise(r=>{v.onseeked=r;v.currentTime=t;}),2500);}catch(e){continue;}
     try{cx.drawImage(v,0,0,128,72);const d=cx.getImageData(0,0,128,72).data;const gray=new Float32Array(128*72);
       for(let p=0;p<gray.length;p++)gray[p]=d[p*4]*0.3+d[p*4+1]*0.59+d[p*4+2]*0.11;
       if(prev){let diff=0;for(let p=0;p<gray.length;p++)diff+=Math.abs(gray[p]-prev[p]);motion[Math.round(t)]=diff/gray.length;}
       prev=gray;}catch(e){}
     setProg(45+Math.round(40*(i+1)/samples));
   }
+  v.removeAttribute("src");
   const maxA=Math.max(...audioPerSec,0.001);const mVals=Object.values(motion);const maxM=mVals.length?Math.max(...mVals,0.001):1;
-  const scoreAt=s=>{let sc=(audioPerSec[Math.floor(s)]||0)/maxA;const mk=Object.keys(motion).map(Number);if(mk.length){let best=mk[0];mk.forEach(k=>{if(Math.abs(k-s)<Math.abs(best-s))best=k;});sc=sc*0.65+((motion[best]||0)/maxM)*0.35;}return sc;};
+  const scoreAt=s=>{let sc=audioOk?(audioPerSec[Math.floor(s)]||0)/maxA:0;const mk=Object.keys(motion).map(Number);if(mk.length){let best=mk[0];mk.forEach(k=>{if(Math.abs(k-s)<Math.abs(best-s))best=k;});sc=sc*(audioOk?0.65:0)+((motion[best]||0)/maxM)*(audioOk?0.35:1);}return sc;};
   setProg(92);setStatus("Armando los mejores momentos…");
   return pickSegments(total,durWanted,scoreAt);
 }
 function pickSegments(total,durWanted,scoreAt){
   const n=+$("#numClips").value;const dur=Math.min(durWanted,total);
   const windows=[];for(let s=0;s+dur<=total;s+=2){let sc=0,c=0;for(let x=s;x<s+dur;x+=4){sc+=scoreAt(x);c++;}windows.push({start:s,score:sc/Math.max(1,c)});}
+  /* Sin señal útil (todo plano): repartir los momentos a lo largo del video. */
+  const scs=windows.map(w=>w.score);if(scs.length&&Math.max(...scs)-Math.min(...scs)<0.02){
+    const out=[];for(let i=0;i<n;i++){const f=n===1?0.3:(0.08+ (0.84*i)/(Math.max(1,n-1)));const start=Math.min(Math.max(0,total*f),Math.max(0,total-dur));out.push({start,end:Math.min(total,start+dur),score:50});}
+    return out;
+  }
   windows.sort((a,b)=>b.score-a.score);const chosen=[];
   for(const w of windows){if(chosen.length>=n)break;if(chosen.every(c=>Math.abs(c.start-w.start)>=dur*0.85))chosen.push(w);}
   if(!chosen.length)chosen.push({start:0,score:0.5});
@@ -325,8 +347,9 @@ function analyzeTranscript(durWanted){
 }
 
 /* ---------- ejecutar análisis ---------- */
+$("#cancelBtn").onclick=()=>{state.cancelled=true;setStatus("Cancelando…");};
 $("#analyzeBtn").onclick=async()=>{
-  const btn=$("#analyzeBtn");btn.disabled=true;setProg(4);
+  const btn=$("#analyzeBtn");btn.disabled=true;state.cancelled=false;$("#cancelBtn").classList.remove("hidden");setProg(4);
   try{
     const durWanted=+durRange.value;
     let segments=[];
@@ -354,8 +377,12 @@ $("#analyzeBtn").onclick=async()=>{
     if(state.mode==="up")setStatus("✅ Listo: "+state.clips.length+" momentos detectados por energía de audio y cambios de imagen. Revísalos abajo.");
     else if(state.transcriptEntries.length)setStatus("✅ Listo: "+state.clips.length+" momentos detectados por las palabras fuertes de tu transcripción. Revísalos abajo.");
     $("#resultsCard").classList.remove("hidden");$("#resultsCard").scrollIntoView({behavior:"smooth"});
-  }catch(err){setStatus("Hubo un problema analizando: "+err.message+". Prueba de nuevo o sube el video como archivo.");setProg(null);}
-  btn.disabled=false;
+  }catch(err){
+    if(err.message==="cancelado"||state.cancelled){setStatus("Análisis cancelado. Puedes intentarlo de nuevo: ahora tiene límites de tiempo y no se queda colgado.");}
+    else setStatus("Hubo un problema analizando: "+err.message+". Prueba de nuevo o sube el video como archivo.");
+    setProg(null);
+  }
+  $("#cancelBtn").classList.add("hidden");btn.disabled=false;
 };
 
 /* ---------- render de clips ---------- */
